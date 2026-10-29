@@ -802,11 +802,261 @@ test('a new announcement supersedes a pending completion sentence', () => {
   })
 })
 
+test('a library holds several configurations, each with its own intervals', () => {
+  const body = loadPlugin()
+  const { normalizeLibrary } = body.__test
+  const library = normalizeLibrary({
+    activeId: 'cfg-b',
+    configs: [
+      { id: 'cfg-a', name: 'Morning', intervals: [{ id: 'a', name: 'Warm up', seconds: 60 }] },
+      { id: 'cfg-b', name: 'Evening', intervals: [{ id: 'b', name: 'Sprint', seconds: 30 }, { id: 'c', name: 'Rest', seconds: 60 }], loop: true },
+    ],
+  })
+  assert.equal(library.version, 2)
+  assert.equal(library.configs.length, 2)
+  assert.equal(library.activeId, 'cfg-b')
+  assert.equal(library.configs[0].intervals[0].name, 'Warm up')
+  assert.equal(library.configs[1].intervals.length, 2)
+  assert.equal(library.configs[1].loop, true, 'each configuration keeps its own options')
+  assert.equal(library.configs[0].loop, false)
+  // A configuration without an id still gets one, so it can be selected.
+  const generated = normalizeLibrary({ configs: [{ name: 'No id' }] })
+  assert.match(generated.configs[0].id, /^[A-Za-z0-9_-]{1,64}$/)
+  // An active id naming nothing falls back to the first configuration.
+  assert.equal(normalizeLibrary({ activeId: 'missing', configs: [{ id: 'one' }, { id: 'two' }] }).activeId, 'one')
+})
+
+test('a version-1 single series is read as a one-configuration library', () => {
+  const body = loadPlugin()
+  const library = body.__test.normalizeLibrary({ version: 1, intervals: [{ id: 'a', name: 'Warm up', seconds: 90 }], updatedAt: 1234 })
+  assert.equal(library.configs.length, 1)
+  assert.equal(library.configs[0].intervals[0].seconds, 90)
+  assert.equal(library.activeId, library.configs[0].id)
+  assert.equal(library.updatedAt, 1234)
+})
+
+test('switching configurations is allowed only while nothing runs', () => {
+  const clock = { now: 0 }
+  const drive = buildEngine(loadPlugin(), clock, [])
+  drive.setLibrary({
+    activeId: 'cfg-a',
+    configs: [
+      { id: 'cfg-a', name: 'Morning', intervals: [{ id: 'a', name: 'A', seconds: 10 }] },
+      { id: 'cfg-b', name: 'Evening', intervals: [{ id: 'b', name: 'B', seconds: 20 }] },
+    ],
+  })
+  assert.equal(drive.getState().series.intervals[0].id, 'a', 'the active configuration is the one on screen')
+  assert.equal(drive.selectConfig('cfg-b'), true)
+  assert.equal(drive.getState().library.activeId, 'cfg-b')
+  assert.equal(drive.getState().series.intervals[0].id, 'b')
+  assert.equal(drive.selectConfig('nope'), false, 'an unknown configuration is refused')
+
+  drive.start()
+  assert.equal(drive.selectConfig('cfg-a'), false, 'a live run owns its configuration')
+  assert.equal(drive.getState().series.intervals[0].id, 'b')
+  drive.stop()
+  assert.equal(drive.selectConfig('cfg-a'), true)
+})
+
+test('editing options and intervals touches only the active configuration', () => {
+  const clock = { now: 0 }
+  const drive = buildEngine(loadPlugin(), clock, [])
+  drive.setLibrary({
+    activeId: 'cfg-a',
+    configs: [
+      { id: 'cfg-a', name: 'Morning', intervals: [{ id: 'a', name: 'A', seconds: 10 }] },
+      { id: 'cfg-b', name: 'Evening', intervals: [{ id: 'b', name: 'B', seconds: 20 }], voice: false },
+    ],
+  })
+  drive.setOption('voice', false)
+  assert.equal(drive.getState().library.configs[0].voice, false)
+  assert.equal(drive.getState().library.configs[1].voice, false, 'the other configuration already had it off')
+  drive.setOption('loop', true)
+  assert.equal(drive.getState().library.configs[0].loop, true)
+  assert.equal(drive.getState().library.configs[1].loop, false, 'the other configuration is untouched')
+  drive.addInterval()
+  assert.equal(drive.getState().library.configs[0].intervals.length, 2)
+  assert.equal(drive.getState().library.configs[1].intervals.length, 1)
+  drive.selectConfig('cfg-b')
+  assert.equal(drive.getState().series.name, 'Evening')
+  assert.equal(drive.getState().series.intervals.length, 1)
+})
+
+test('configurations can be added, renamed, duplicated and removed', () => {
+  const clock = { now: 0 }
+  const drive = buildEngine(loadPlugin(), clock, [])
+  assert.equal(drive.getState().library.configs.length, 1, 'a fresh engine has one configuration')
+  assert.equal(drive.addConfig(), true)
+  let library = drive.getState().library
+  assert.equal(library.configs.length, 2)
+  assert.equal(library.activeId, library.configs[1].id, 'the new configuration becomes active')
+  assert.equal(drive.getState().series.intervals.length, 1, 'a new configuration starts with one interval')
+
+  drive.renameActiveConfig('Evening   run')
+  assert.equal(drive.getState().series.name, 'Evening run', 'runs of whitespace collapse')
+  drive.setSeries({ intervals: [{ id: 'x', name: 'Sprint', seconds: 30 }], loop: true })
+  assert.equal(drive.duplicateConfig(), true)
+  library = drive.getState().library
+  assert.equal(library.configs.length, 3)
+  const copy = drive.getState().series
+  assert.notEqual(copy.id, library.configs[1].id)
+  assert.equal(copy.name, 'Evening run copy')
+  assert.equal(copy.loop, true, 'the copy keeps the options')
+  assert.notEqual(copy.intervals[0].id, 'x', 'the copy gets fresh interval ids')
+
+  assert.equal(drive.removeConfig(), true)
+  library = drive.getState().library
+  assert.equal(library.configs.length, 2)
+  assert.notEqual(drive.getState().series.id, 'deleted')
+  // The last configuration cannot be removed: there must always be somewhere to
+  // keep intervals.
+  drive.removeConfig()
+  assert.equal(drive.getState().library.configs.length, 1)
+  assert.equal(drive.removeConfig(), false)
+})
+
+test('a run reopens the configuration it was running after a reload', () => {
+  const body = loadPlugin()
+  const storage = memoryStorage()
+  const clock = { now: 1000 }
+  const first = createEngine(body, clock, { storage })
+  first.setLibrary({
+    activeId: 'cfg-a',
+    configs: [
+      { id: 'cfg-a', name: 'Morning', intervals: [{ id: 'a', name: 'A', seconds: 10 }] },
+      { id: 'cfg-b', name: 'Evening', intervals: [{ id: 'b', name: 'B', seconds: 20 }] },
+    ],
+  })
+  first.selectConfig('cfg-b')
+  first.start()
+  assert.equal(first.getState().status, 'running')
+
+  const second = createEngine(body, clock, { storage })
+  second.restore()
+  assert.equal(second.getState().library.configs.length, 2)
+  assert.equal(second.getState().library.activeId, 'cfg-b', 'the running configuration is the one reopened')
+  assert.equal(second.getState().series.intervals[0].id, 'b')
+  assert.equal(second.getState().status, 'running')
+  assert.equal(second.getState().remainingMs, 20_000)
+})
+
+test('a version-1 stored state is migrated into a library and restores its run', () => {
+  const body = loadPlugin()
+  const storage = memoryStorage()
+  storage.setItem(
+    'dsh-advanced-timer:v1',
+    JSON.stringify({
+      status: 'running',
+      starting: false,
+      index: 1,
+      endsAt: 5000,
+      pausedRemaining: 0,
+      warned: false,
+      series: { intervals: [{ id: 'a', name: 'A', seconds: 2 }, { id: 'b', name: 'B', seconds: 8 }] },
+    }),
+  )
+  const engine = createEngine(body, { now: 0 }, { storage })
+  engine.restore()
+  assert.equal(engine.getState().library.configs.length, 1)
+  assert.equal(engine.getState().library.configs[0].intervals.length, 2)
+  assert.equal(engine.getState().status, 'running')
+  assert.equal(engine.getState().index, 1)
+  assert.equal(engine.getState().remainingMs, 5000)
+})
+
+test('a save ships every configuration, and the Host stamp lands on the library', async () => {
+  const clock = { now: 0 }
+  const saves = []
+  const engine = createEngine(loadPlugin(), clock, {
+    saver: null,
+  })
+  engine.setSaver(async (library) => {
+    saves.push(library)
+    return { ...library, updatedAt: 4242 }
+  })
+  engine.setLibrary({
+    activeId: 'cfg-a',
+    configs: [
+      { id: 'cfg-a', name: '  Morning  ', intervals: [{ id: 'a', name: '  Warm up  ', seconds: 10 }] },
+      { id: 'cfg-b', name: 'Evening', intervals: [{ id: 'b', name: 'B', seconds: 20 }] },
+    ],
+  })
+  await new Promise((resolve) => setTimeout(resolve, 520))
+  assert.equal(saves.length, 1, 'the debounced save fires once')
+  assert.equal(saves[0].configs.length, 2, 'the whole library is sent')
+  assert.equal(saves[0].configs[0].name, 'Morning', 'names are trimmed at the save boundary')
+  assert.equal(saves[0].configs[0].intervals[0].name, 'Warm up')
+  assert.equal(engine.getState().library.updatedAt, 4242, 'the Host write stamp is taken')
+  assert.equal(engine.getState().save, 'saved')
+})
+
+test('the page offers a configuration picker with every saved configuration', () => {
+  const body = loadPlugin()
+  const { registrations } = applyPlugin(body)
+  const page = registrations.find((entry) => entry.options.name === 'main')
+  const engine = buildEngine(body, { now: 0 }, [])
+  engine.setLibrary({
+    activeId: 'cfg-b',
+    configs: [
+      { id: 'cfg-a', name: 'Morning', intervals: [{ id: 'a', name: 'A', seconds: 10 }] },
+      { id: 'cfg-b', name: 'Evening', intervals: [{ id: 'b', name: 'B', seconds: 20 }] },
+    ],
+  })
+  const tree = page.component({ t: (key) => key, engine })
+  const selects = []
+  const options = []
+  const walk = (node) => {
+    // `createElement('select', props, configs.map(...))` stores the mapped array
+    // as one child, so the walk has to flatten arrays itself.
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child)
+      return
+    }
+    if (node === null || typeof node !== 'object') return
+    if (node.type === 'select' && node.props?.className === 'at-config-select') selects.push(node)
+    if (node.type === 'option') options.push(node)
+    for (const child of node.children ?? []) walk(child)
+  }
+  walk(tree)
+  assert.equal(selects.length, 1, 'one configuration picker')
+  assert.equal(selects[0].props.value, 'cfg-b')
+  assert.equal(options.length, 2, 'an option per configuration')
+  assert.equal(selects[0].props.disabled, false)
+})
+
+/** A localStorage-shaped store, so persistence tests can inspect the keys. */
+function memoryStorage() {
+  const map = new Map()
+  return {
+    map,
+    getItem: (key) => (map.has(key) ? map.get(key) : null),
+    setItem: (key, value) => map.set(key, String(value)),
+    removeItem: (key) => map.delete(key),
+  }
+}
+
 /** Build an engine with test seams, wired the way `apply` wires it. */
-function buildEngine(body, clock, announcements, warnings = [], beeps = [], signals = [], completions = []) {
+function createEngine(body, clock, overrides = {}) {
   const engine = body.__test.createTimerEngine({
     autoTick: false,
     now: () => clock.now,
+    ...overrides,
+  })
+  engine.setTranslate((key) => {
+    if (key === 'start') return 'Start'
+    if (key === 'intervalIndex') return 'Interval {n}'
+    if (key === 'fiveSecondsLeft') return '5 seconds left'
+    if (key === 'allCyclesCompleted') return 'All cycles completed'
+    if (key === 'copySuffix') return 'copy'
+    if (key === 'configUntitled') return 'Configuration {n}'
+    return key
+  })
+  return engine
+}
+
+/** Build an engine with recording seams. */
+function buildEngine(body, clock, announcements, warnings = [], beeps = [], signals = [], completions = []) {
+  return createEngine(body, clock, {
     // No voice in tests: `false` means "nothing spoken", so the countdown starts
     // immediately instead of waiting for a speech completion that never comes.
     announce: (announcement) => {
@@ -819,14 +1069,6 @@ function buildEngine(body, clock, announcements, warnings = [], beeps = [], sign
     complete: (completion) => completions.push({ ...completion }),
     hush: () => {},
   })
-  engine.setTranslate((key) => {
-    if (key === 'start') return 'Start'
-    if (key === 'intervalIndex') return 'Interval {n}'
-    if (key === 'fiveSecondsLeft') return '5 seconds left'
-    if (key === 'allCyclesCompleted') return 'All cycles completed'
-    return key
-  })
-  return engine
 }
 
-console.log('client bundle: factory registered, slots registered, engine runs back to back')
+console.log('client bundle: factory registered, slots registered, configurations saved and switched')

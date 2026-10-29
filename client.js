@@ -20,7 +20,12 @@ window.__ModuleLoader__.load({
 
     const NS = 'advancedTimer'
     const PANEL_ID = 'advanced-timer'
-    const STORAGE_KEY = 'dsh-advanced-timer:v1'
+    /** Where the browser keeps the saved library of configurations. */
+    const STORAGE_LIBRARY = 'dsh-advanced-timer:library:v2'
+    /** Where it keeps the live run: status, interval and deadline. */
+    const STORAGE_RUN = 'dsh-advanced-timer:run:v2'
+    /** The single-key state written before configurations existed. */
+    const STORAGE_LEGACY = 'dsh-advanced-timer:v1'
 
     // ---------------------------------------------------------------- locale
 
@@ -29,7 +34,16 @@ window.__ModuleLoader__.load({
       title: '高级计时器',
       intro: '把训练或工作拆成若干段：每段有自己的名字和时长，按顺序首尾相接连续运行。每段开始时都会播报该段名称与「开始」。',
       seriesTitle: '分段序列',
-      seriesHint: '按顺序添加分段，每段独立计时；上一段结束的瞬间下一段立即开始。',
+      seriesHint: '按顺序添加分段，每段独立计时；上一段结束的瞬间下一段立即开始。每个配置都有自己的分段和选项。',
+      configurations: '配置',
+      configName: '配置名称',
+      configNamePlaceholder: '配置名称（例如：晨间训练）',
+      configUntitled: '配置 {n}',
+      newConfig: '新建配置',
+      duplicateConfig: '复制配置',
+      deleteConfig: '删除配置',
+      deleteConfigConfirm: '删除这个配置及其所有分段？',
+      copySuffix: '副本',
       empty: '还没有分段。点下方「添加分段」开始。',
       addInterval: '添加分段',
       namePlaceholder: '分段名称（例如：热身）',
@@ -76,9 +90,18 @@ window.__ModuleLoader__.load({
     const en = {
       panel: 'Advanced Timer',
       title: 'Advanced Timer',
-      intro: 'Split a session into intervals: each has its own name and length, and they run back to back with no gap. Every interval start is announced with its name and “Start”.',
+      intro: 'Split a session into intervals: each has its own name and length, and they run back to back with no gap. Every interval start is announced with its name and “Start”. Keep several saved configurations and switch between them.',
       seriesTitle: 'Interval series',
-      seriesHint: 'Add intervals in order. Each one counts down on its own; the next starts the instant the previous ends.',
+      seriesHint: 'Add intervals in order. Each one counts down on its own; the next starts the instant the previous ends. Every configuration keeps its own intervals and options.',
+      configurations: 'Configurations',
+      configName: 'Configuration name',
+      configNamePlaceholder: 'Configuration name (for example: Morning workout)',
+      configUntitled: 'Configuration {n}',
+      newConfig: 'New configuration',
+      duplicateConfig: 'Duplicate configuration',
+      deleteConfig: 'Delete configuration',
+      deleteConfigConfirm: 'Delete this configuration and all of its intervals?',
+      copySuffix: 'copy',
       empty: 'No intervals yet. Press “Add interval” to begin.',
       addInterval: 'Add interval',
       namePlaceholder: 'Interval name (for example: Warm up)',
@@ -158,6 +181,12 @@ window.__ModuleLoader__.load({
 .at-options{display:flex;flex-wrap:wrap;gap:14px;padding-top:2px;border-top:1px solid var(--dsw-alias-border-l1)}
 .at-option{display:inline-flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary);font-size:12px;cursor:pointer;user-select:none}
 .at-option input{accent-color:var(--dsw-alias-brand-primary);margin:0}
+.at-configs{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:8px 10px;border-radius:9px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2)}
+.at-config-select{flex:0 1 150px;min-width:110px;font:inherit;font-size:12px;padding:5px 6px;border-radius:7px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);cursor:pointer}
+.at-config-name{flex:1 1 130px;min-width:100px;font:inherit;font-size:12px;padding:5px 8px;border-radius:7px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}
+.at-config-select:disabled,.at-config-name:disabled{opacity:.6;cursor:default}
+.at-config-select:focus,.at-config-name:focus{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:-1px}
+.at-hud-config{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .at-save{font-size:11px;color:var(--dsw-alias-label-tertiary)}
 .at-save[data-tone="error"]{color:var(--dsw-alias-state-warn-primary)}
 .at-now{position:sticky;top:12px}
@@ -263,21 +292,44 @@ window.__ModuleLoader__.load({
       return `iv-${Date.now().toString(36)}-${idCounter.toString(36)}`
     }
 
-    /** The comparable part of a series: everything but the write stamp. */
-    function stripStamp(series) {
-      const { updatedAt: _ignored, ...rest } = series
-      return rest
+    /** A fresh configuration id. */
+    function makeConfigId() {
+      idCounter += 1
+      return `cfg-${Date.now().toString(36)}-${idCounter.toString(36)}`
     }
 
-    /** A series shaped the way the Host stores it. */
-    function normalizeSeries(input) {
-      const source = input !== null && typeof input === 'object' && !Array.isArray(input) ? input : {}
-      const rows = Array.isArray(source.intervals) ? source.intervals.slice(0, 50) : []
+    const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+    /** A library longer than this is not a picker any more. */
+    const MAX_CONFIGS = 20
+    /** A configuration name is a picker label, shorter than an interval name. */
+    const MAX_CONFIG_NAME = 60
+
+    /**
+     * One name, with runs of whitespace collapsed and the length capped.
+     *
+     * Trimming belongs to the save boundary: the page must not eat the space the
+     * user just typed between two words.
+     */
+    function cleanName(value, max) {
+      return String(value ?? '')
+        .replace(/\s+/g, ' ')
+        .slice(0, max)
+    }
+
+    /** A write stamp in whole milliseconds, or 0 when there is none. */
+    function stampOf(value) {
+      const stamp = Number(value)
+      return Number.isFinite(stamp) && stamp > 0 ? Math.floor(stamp) : 0
+    }
+
+    /** Clean one interval list, replacing missing or duplicate ids. */
+    function normalizeIntervals(input) {
+      const rows = Array.isArray(input) ? input.slice(0, 50) : []
       const seen = new Set()
       const intervals = []
       for (const row of rows) {
         if (row === null || typeof row !== 'object' || Array.isArray(row)) continue
-        let id = typeof row.id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(row.id) ? row.id : makeId()
+        let id = typeof row.id === 'string' && ID_PATTERN.test(row.id) ? row.id : makeId()
         while (seen.has(id)) id = makeId()
         seen.add(id)
         intervals.push({
@@ -286,19 +338,85 @@ window.__ModuleLoader__.load({
           seconds: clampSeconds(row.seconds),
         })
       }
-      const stamp = Number(source.updatedAt)
+      return intervals
+    }
+
+    /**
+     * One configuration: an id, a name, its interval list and its own options.
+     * @param {unknown} input - whatever was stored or sent.
+     * @returns {object} the cleaned configuration.
+     */
+    function normalizeConfig(input) {
+      const source = input !== null && typeof input === 'object' && !Array.isArray(input) ? input : {}
+      const id = typeof source.id === 'string' && ID_PATTERN.test(source.id) ? source.id : makeConfigId()
       return {
-        version: 1,
-        intervals,
+        id,
+        name: cleanName(source.name, MAX_CONFIG_NAME),
+        intervals: normalizeIntervals(source.intervals),
         loop: source.loop === true,
         voice: source.voice !== false,
-        beep: source.beep !== false,
         // The countdown warning is on unless the user turned it off.
         warn: source.warn !== false,
+        // The start/end boundary tones, on unless turned off.
+        beep: source.beep !== false,
         // A short tick on every elapsed second of every interval.
         secondBeep: source.secondBeep !== false,
-        updatedAt: Number.isFinite(stamp) && stamp > 0 ? Math.floor(stamp) : 0,
       }
+    }
+
+    /** Wrap the single-series shape written by version 1 into a library. */
+    function libraryFromSeries(series) {
+      const config = normalizeConfig(series)
+      return {
+        version: 2,
+        activeId: config.id,
+        configs: [config],
+        updatedAt: stampOf(series !== null && typeof series === 'object' ? series.updatedAt : 0),
+      }
+    }
+
+    /** A library with one empty, unnamed configuration. */
+    function emptyLibrary() {
+      return libraryFromSeries({})
+    }
+
+    /**
+     * Normalise a whole library, including the version-1 single-series shape.
+     * @param {unknown} input - whatever was stored or sent by the Host.
+     * @returns {{version: number, activeId: string, configs: Array<object>, updatedAt: number}} the cleaned library.
+     */
+    function normalizeLibrary(input) {
+      const source = input !== null && typeof input === 'object' && !Array.isArray(input) ? input : {}
+      // A version-1 state (and the old Host route) is a series, not a library.
+      if (!Array.isArray(source.configs)) return libraryFromSeries(source)
+      const rows = source.configs.slice(0, MAX_CONFIGS)
+      const seen = new Set()
+      const configs = []
+      for (const row of rows) {
+        if (row === null || typeof row !== 'object' || Array.isArray(row)) continue
+        const config = normalizeConfig(row)
+        while (seen.has(config.id)) config.id = makeConfigId()
+        seen.add(config.id)
+        configs.push(config)
+      }
+      if (configs.length === 0) return emptyLibrary()
+      const requested = typeof source.activeId === 'string' ? source.activeId : ''
+      return {
+        version: 2,
+        activeId: configs.some((config) => config.id === requested) ? requested : configs[0].id,
+        configs,
+        updatedAt: stampOf(source.updatedAt),
+      }
+    }
+
+    /** The configuration the engine works on: the active one. */
+    function activeConfig(library) {
+      return library.configs.find((config) => config.id === library.activeId) ?? library.configs[0]
+    }
+
+    /** The comparable part of a library: everything but the write stamp. */
+    function comparableLibrary(library) {
+      return { version: library.version, activeId: library.activeId, configs: library.configs }
     }
 
     /** How long before an interval ends its spoken warning fires. */
@@ -373,6 +491,7 @@ window.__ModuleLoader__.load({
        * implementation detail of "once per second", never shown.
        */
       let lastBeepSecond = -1
+      const initialLibrary = emptyLibrary()
       let state = {
         status: 'idle',
         /**
@@ -380,7 +499,10 @@ window.__ModuleLoader__.load({
          * spoken: the clock shows the full interval but does not move.
          */
         starting: false,
-        series: normalizeSeries(null),
+        /** Every saved configuration, plus which one is active. */
+        library: initialLibrary,
+        /** The active configuration. Kept in step with `library` by syncActive. */
+        series: initialLibrary.configs[0],
         index: 0,
         endsAt: 0,
         remainingMs: 0,
@@ -411,42 +533,175 @@ window.__ModuleLoader__.load({
         return state
       }
 
-      function setSeries(next) {
-        state.series = normalizeSeries(next)
+      /** True while a run owns the configuration and editing is refused. */
+      function locked() {
+        return state.status === 'running' || state.status === 'paused'
+      }
+
+      /** Point `state.series` at `library.activeId`, healing a stale id. */
+      function syncActive() {
+        const config = activeConfig(state.library)
+        state.series = config
+        if (state.library.activeId !== config.id) state.library = { ...state.library, activeId: config.id }
+      }
+
+      /** Reset every run field; the configuration itself is untouched. */
+      function resetRun() {
+        cancelStartGate()
+        hushOut?.()
         state.status = 'idle'
+        state.starting = false
         state.index = 0
         state.endsAt = 0
         state.remainingMs = 0
+        state.pausedRemaining = 0
+        state.announcement = null
+        state.warned = false
         stopTicker()
+      }
+
+      /** Write one configuration back into the library and publish it. */
+      function commitConfig(config) {
+        state.library = {
+          ...state.library,
+          configs: state.library.configs.map((row) => (row.id === config.id ? config : row)),
+        }
+        syncActive()
         persist()
         scheduleSave()
         notify()
       }
 
       /**
+       * Replace the whole library (the Host copy loaded at startup, or a test).
+       * @param {unknown} next - the library to take.
+       * @returns {boolean} whether it was taken; a live run refuses it.
+       */
+      function setLibrary(next) {
+        if (locked()) return false
+        state.library = normalizeLibrary(next)
+        syncActive()
+        resetRun()
+        persist()
+        scheduleSave()
+        notify()
+        return true
+      }
+
+      /**
        * Adopt the Host's copy, but never over a run in progress, an edit the user
        * made while the fetch was in flight, or a local copy the Host has not
        * caught up with yet.
-       * @param {unknown} next - the series the Host returned.
-       * @param {string} [pristine] - the series as it looked before any edit.
+       * @param {unknown} next - the library the Host returned.
+       * @param {string} [pristine] - the library as it looked before any edit.
        * @returns {boolean} whether the Host copy was taken.
        */
-      function adoptSeries(next, pristine) {
+      function adoptLibrary(next, pristine) {
         if (state.status !== 'idle') return false
-        if (typeof pristine === 'string' && JSON.stringify(stripStamp(state.series)) !== pristine) return false
-        const incoming = normalizeSeries(next)
+        if (typeof pristine === 'string' && JSON.stringify(comparableLibrary(state.library)) !== pristine) return false
+        const incoming = normalizeLibrary(next)
         // The local copy is written on every edit and the Host save is debounced,
         // so a Host stamp older than the local one means this browser is ahead —
         // adopting it would roll the user's last edit back.
-        if (incoming.updatedAt > 0 && incoming.updatedAt < state.series.updatedAt) return false
-        state.series = incoming
+        if (incoming.updatedAt > 0 && incoming.updatedAt < state.library.updatedAt) return false
+        state.library = incoming
+        syncActive()
+        resetRun()
         persist()
         notify()
         return true
       }
 
+      /**
+       * Replace the active configuration's content, keeping its id and name.
+       * @param {unknown} next - the configuration body to install.
+       */
+      function setSeries(next) {
+        const source = normalizeConfig(next)
+        resetRun()
+        commitConfig({ ...source, id: state.series.id, name: state.series.name })
+      }
+
+      /** Rename the active configuration. */
+      function renameActiveConfig(name) {
+        if (locked()) return
+        commitConfig({ ...state.series, name: cleanName(name, MAX_CONFIG_NAME) })
+      }
+
+      /** Switch to another configuration; only while nothing is running. */
+      function selectConfig(id) {
+        if (locked()) return false
+        if (!state.library.configs.some((config) => config.id === id)) return false
+        if (state.library.activeId === id) return false
+        state.library = { ...state.library, activeId: id }
+        syncActive()
+        resetRun()
+        persist()
+        scheduleSave()
+        notify()
+        return true
+      }
+
+      /** Add a new configuration and make it active. */
+      function addConfig() {
+        if (locked()) return false
+        if (state.library.configs.length >= MAX_CONFIGS) return false
+        const config = normalizeConfig({ intervals: [{ id: makeId(), name: '', seconds: 60 }] })
+        state.library = {
+          ...state.library,
+          configs: state.library.configs.concat([config]),
+          activeId: config.id,
+        }
+        syncActive()
+        resetRun()
+        persist()
+        scheduleSave()
+        notify()
+        return true
+      }
+
+      /** Copy the active configuration, so a variant starts from a full list. */
+      function duplicateConfig() {
+        if (locked()) return false
+        if (state.library.configs.length >= MAX_CONFIGS) return false
+        const trimmed = state.series.name.trim()
+        const copy = normalizeConfig({
+          ...state.series,
+          id: undefined,
+          name: trimmed === '' ? '' : `${trimmed} ${translate('copySuffix')}`,
+          intervals: state.series.intervals.map((row) => ({ ...row, id: makeId() })),
+        })
+        const index = state.library.configs.findIndex((row) => row.id === state.series.id)
+        const configs = state.library.configs.slice()
+        configs.splice(index + 1, 0, copy)
+        state.library = { ...state.library, configs, activeId: copy.id }
+        syncActive()
+        resetRun()
+        persist()
+        scheduleSave()
+        notify()
+        return true
+      }
+
+      /** Remove the active configuration; the last one cannot be removed. */
+      function removeConfig() {
+        if (locked()) return false
+        const configs = state.library.configs
+        if (configs.length <= 1) return false
+        const index = configs.findIndex((row) => row.id === state.series.id)
+        const remaining = configs.filter((row) => row.id !== state.series.id)
+        const activeId = remaining[Math.min(Math.max(index, 0), remaining.length - 1)].id
+        state.library = { ...state.library, configs: remaining, activeId }
+        syncActive()
+        resetRun()
+        persist()
+        scheduleSave()
+        notify()
+        return true
+      }
+
       function updateInterval(id, patch) {
-        if (state.status === 'running' || state.status === 'paused') return
+        if (locked()) return
         const index = state.series.intervals.findIndex((row) => row.id === id)
         if (index < 0) return
         const next = state.series.intervals.slice()
@@ -457,50 +712,36 @@ window.__ModuleLoader__.load({
         if (patch.name !== undefined) row.name = String(patch.name).replace(/\s+/g, ' ').slice(0, 80)
         if (patch.seconds !== undefined) row.seconds = clampSeconds(patch.seconds)
         next[index] = row
-        state.series = { ...state.series, intervals: next }
-        persist()
-        scheduleSave()
-        notify()
+        commitConfig({ ...state.series, intervals: next })
       }
 
       function addInterval() {
-        if (state.status === 'running' || state.status === 'paused') return
+        if (locked()) return
         if (state.series.intervals.length >= 50) return
         const intervals = state.series.intervals.concat([{ id: makeId(), name: '', seconds: 60 }])
-        state.series = { ...state.series, intervals }
-        persist()
-        scheduleSave()
-        notify()
+        commitConfig({ ...state.series, intervals })
       }
 
       function removeInterval(id) {
-        if (state.status === 'running' || state.status === 'paused') return
-        state.series = { ...state.series, intervals: state.series.intervals.filter((row) => row.id !== id) }
-        persist()
-        scheduleSave()
-        notify()
+        if (locked()) return
+        commitConfig({ ...state.series, intervals: state.series.intervals.filter((row) => row.id !== id) })
       }
 
       function moveInterval(id, direction) {
-        if (state.status === 'running' || state.status === 'paused') return
+        if (locked()) return
         const rows = state.series.intervals.slice()
         const index = rows.findIndex((row) => row.id === id)
         const target = index + direction
         if (index < 0 || target < 0 || target >= rows.length) return
         const [row] = rows.splice(index, 1)
         rows.splice(target, 0, row)
-        state.series = { ...state.series, intervals: rows }
-        persist()
-        scheduleSave()
-        notify()
+        commitConfig({ ...state.series, intervals: rows })
       }
 
       function setOption(key, value) {
         if (key !== 'loop' && key !== 'voice' && key !== 'beep' && key !== 'warn' && key !== 'secondBeep') return
-        state.series = { ...state.series, [key]: Boolean(value) }
-        persist()
-        scheduleSave()
-        notify()
+        if (locked()) return
+        commitConfig({ ...state.series, [key]: Boolean(value) })
       }
 
       /** Drop a pending start gate and invalidate its completion callback. */
@@ -873,17 +1114,21 @@ window.__ModuleLoader__.load({
           // Trim at the save boundary: the Host trims too, so this is where the
           // local copy and the durable one become the same string.
           const outgoing = {
-            ...state.series,
-            intervals: state.series.intervals.map((row) => ({ ...row, name: row.name.trim() })),
+            ...state.library,
+            configs: state.library.configs.map((config) => ({
+              ...config,
+              name: config.name.trim(),
+              intervals: config.intervals.map((row) => ({ ...row, name: row.name.trim() })),
+            })),
           }
           try {
             const saved = await saver(outgoing)
-            // Take only the Host's write stamp. Replacing the whole local series
+            // Take only the Host's write stamp. Replacing the whole local library
             // with the Host's echo would rewrite the input under the caret while
             // the user is still typing in it.
             if (saved !== null && typeof saved === 'object') {
-              const stamp = Number(saved.updatedAt)
-              if (Number.isFinite(stamp) && stamp > 0) state.series = { ...state.series, updatedAt: Math.floor(stamp) }
+              const stamp = stampOf(saved.updatedAt)
+              if (stamp > 0) state.library = { ...state.library, updatedAt: stamp }
             }
             state.save = 'saved'
           } catch {
@@ -898,15 +1143,19 @@ window.__ModuleLoader__.load({
         if (storage === null) return
         try {
           storage.setItem(
-            STORAGE_KEY,
+            STORAGE_LIBRARY,
+            JSON.stringify({ library: state.library, savedAt: now() }),
+          )
+          storage.setItem(
+            STORAGE_RUN,
             JSON.stringify({
               status: state.status,
               starting: state.starting,
+              configId: state.library.activeId,
               index: state.index,
               endsAt: state.endsAt,
               pausedRemaining: state.pausedRemaining,
               warned: state.warned,
-              series: state.series,
               savedAt: now(),
             }),
           )
@@ -915,18 +1164,65 @@ window.__ModuleLoader__.load({
         }
       }
 
-      /** Resume a run that was live when the page was last closed. */
+      /**
+       * Read the stored library and run, migrating the single-key version-1 state.
+       * @returns {{library: object|null, run: object|null}} what was found.
+       */
+      function readStored() {
+        let library = null
+        let run = null
+        try {
+          const raw = storage.getItem(STORAGE_LIBRARY)
+          if (raw !== null) {
+            const parsed = JSON.parse(raw)
+            library = normalizeLibrary(parsed?.library ?? parsed)
+          }
+        } catch {
+          library = null
+        }
+        try {
+          const raw = storage.getItem(STORAGE_RUN)
+          if (raw !== null) {
+            const parsed = JSON.parse(raw)
+            if (parsed !== null && typeof parsed === 'object') run = parsed
+          }
+        } catch {
+          run = null
+        }
+        if (library === null) {
+          // Version 1 kept the series and the run in one object under one key.
+          try {
+            const raw = storage.getItem(STORAGE_LEGACY)
+            if (raw !== null) {
+              const parsed = JSON.parse(raw)
+              if (parsed !== null && typeof parsed === 'object') {
+                library = normalizeLibrary(parsed.series)
+                run = parsed
+              }
+            }
+          } catch {
+            /* a corrupt legacy value is ignored: the Host copy is next */
+          }
+        }
+        return { library, run }
+      }
+
+      /** Resume the configuration and run that were live when the page closed. */
       function restore() {
         if (storage === null) return
-        let saved = null
-        try {
-          const raw = storage.getItem(STORAGE_KEY)
-          if (raw !== null) saved = JSON.parse(raw)
-        } catch {
-          saved = null
+        const stored = readStored()
+        if (stored.library !== null) {
+          state.library = stored.library
+          syncActive()
         }
-        if (saved === null || typeof saved !== 'object') return
-        state.series = normalizeSeries(saved.series)
+        const saved = stored.run
+        if (saved === null) return
+        // A run belongs to one configuration: reopen that one, when it still exists.
+        const configId = typeof saved.configId === 'string' ? saved.configId : state.library.activeId
+        if (state.library.configs.some((config) => config.id === configId) && configId !== state.library.activeId) {
+          state.library = { ...state.library, activeId: configId }
+          syncActive()
+        }
         const count = state.series.intervals.length
         if (count === 0) return
         const index = Math.min(count - 1, Math.max(0, Math.round(Number(saved.index) || 0)))
@@ -980,8 +1276,14 @@ window.__ModuleLoader__.load({
         setLocaleGetter,
         setSaver,
         restore,
-        adoptSeries,
+        setLibrary,
+        adoptLibrary,
         setSeries,
+        selectConfig,
+        addConfig,
+        renameActiveConfig,
+        duplicateConfig,
+        removeConfig,
         updateInterval,
         addInterval,
         removeInterval,
@@ -1237,18 +1539,18 @@ window.__ModuleLoader__.load({
       return new URL(`advanced-timer/api/${path}`.replace(/^\/+/, ''), base).href
     }
 
-    async function fetchSeries() {
-      const response = await fetch(apiUrl('series'), { cache: 'no-store' })
+    async function fetchLibrary() {
+      const response = await fetch(apiUrl('library'), { cache: 'no-store' })
       const payload = await response.json()
-      if (payload?.ok !== true) throw new Error(payload?.error ?? 'series unavailable')
+      if (payload?.ok !== true) throw new Error(payload?.error ?? 'library unavailable')
       return payload.value
     }
 
-    async function saveSeries(series) {
-      const response = await fetch(apiUrl('series'), {
-        method: 'POST',
+    async function saveLibrary(library) {
+      const response = await fetch(apiUrl('library'), {
+        method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ series }),
+        body: JSON.stringify({ library }),
       })
       const payload = await response.json()
       if (payload?.ok !== true) throw new Error(payload?.error ?? 'save failed')
@@ -1298,16 +1600,24 @@ window.__ModuleLoader__.load({
     }
 
     /** An empty state, so a component with no engine renders instead of throwing. */
+    const EMPTY_LIBRARY = emptyLibrary()
     const IDLE_STATE = {
       status: 'idle',
       starting: false,
-      series: { version: 1, intervals: [], loop: false, voice: true, beep: true, warn: true, secondBeep: true },
+      library: EMPTY_LIBRARY,
+      series: EMPTY_LIBRARY.configs[0],
       index: 0,
       endsAt: 0,
       remainingMs: 0,
       pausedRemaining: 0,
       announcement: null,
       save: 'idle',
+    }
+
+    /** The label a configuration is picked by: its name, or its position. */
+    function configLabel(t, config, index) {
+      const name = config.name.trim()
+      return name === '' ? fmt(t('configUntitled'), { n: index + 1 }) : name
     }
 
     /**
@@ -1434,6 +1744,7 @@ window.__ModuleLoader__.load({
       const engine = injected ?? activeEngine
       const state = useTimerState(engine) ?? IDLE_STATE
       const series = state.series
+      const configs = state.library.configs
       const locked = state.status === 'running' || state.status === 'paused'
       const count = series.intervals.length
       const current = series.intervals[state.index]
@@ -1466,6 +1777,74 @@ window.__ModuleLoader__.load({
               { className: 'at-card-head' },
               h('h2', null, t('seriesTitle')),
               h('span', { className: 'at-meta' }, `${fmt(t('count'), { n: count })} · ${fmt(t('total'), { time: formatShort(total) })}`),
+            ),
+            h(
+              'div',
+              { className: 'at-configs' },
+              h(
+                'select',
+                {
+                  className: 'at-config-select',
+                  value: state.library.activeId,
+                  disabled: locked,
+                  'aria-label': t('configurations'),
+                  title: t('configurations'),
+                  onChange: (event) => engine.selectConfig(event.target.value),
+                },
+                configs.map((config, index) => h('option', { key: config.id, value: config.id }, configLabel(t, config, index))),
+              ),
+              h('input', {
+                className: 'at-config-name',
+                type: 'text',
+                value: series.name,
+                placeholder: t('configNamePlaceholder'),
+                maxLength: 60,
+                disabled: locked,
+                'aria-label': t('configName'),
+                onChange: (event) => engine.renameActiveConfig(event.target.value),
+              }),
+              h(
+                'button',
+                {
+                  className: 'at-icon-btn',
+                  type: 'button',
+                  title: t('newConfig'),
+                  'aria-label': t('newConfig'),
+                  disabled: locked || configs.length >= 20,
+                  onClick: () => engine.addConfig(),
+                },
+                '+',
+              ),
+              h(
+                'button',
+                {
+                  className: 'at-icon-btn',
+                  type: 'button',
+                  title: t('duplicateConfig'),
+                  'aria-label': t('duplicateConfig'),
+                  disabled: locked || configs.length >= 20,
+                  onClick: () => engine.duplicateConfig(),
+                },
+                '⧉',
+              ),
+              h(
+                'button',
+                {
+                  className: 'at-icon-btn',
+                  type: 'button',
+                  title: t('deleteConfig'),
+                  'aria-label': t('deleteConfig'),
+                  'data-tone': 'danger',
+                  disabled: locked || configs.length <= 1,
+                  onClick: () => {
+                    // Deleting a configuration takes its whole interval list with
+                    // it, so it asks once before doing it.
+                    const ask = typeof confirm === 'function' ? confirm(t('deleteConfigConfirm')) : true
+                    if (ask) engine.removeConfig()
+                  },
+                },
+                '×',
+              ),
             ),
             h('p', { className: 'at-hint' }, locked ? t('locked') : t('seriesHint')),
             h(
@@ -1618,6 +1997,8 @@ window.__ModuleLoader__.load({
       const onTimerPanel = usePanel((info) => info.activePanelId === PANEL_ID)
       if (onTimerPanel || state.status !== 'running' && state.status !== 'paused') return null
       const count = state.series.intervals.length
+      const configs = state.library.configs
+      const configIndex = configs.findIndex((config) => config.id === state.series.id)
       const current = state.series.intervals[state.index]
       const durationMs = current === undefined ? 0 : current.seconds * 1000
       const progress = durationMs === 0 ? 0 : Math.min(1, Math.max(0, 1 - state.remainingMs / durationMs))
@@ -1638,7 +2019,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'at-hud-foot' },
-          h('span', { className: 'at-meta' }, `${state.index + 1}/${count}`),
+          h('span', { className: 'at-meta at-hud-config', title: configLabel(t, state.series, configIndex) }, `${configLabel(t, state.series, configIndex)} · ${state.index + 1}/${count}`),
           h(
             'div',
             { className: 'at-hud-actions' },
@@ -1686,7 +2067,19 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale'],
       // Engine and helpers are exported for tests only; the Host never calls them.
-      __test: { createTimerEngine, normalizeSeries, formatClock, clampSeconds, totalSeconds, announceCompletion, announceInterval, hush },
+      __test: {
+        createTimerEngine,
+        normalizeLibrary,
+        normalizeConfig,
+        emptyLibrary,
+        comparableLibrary,
+        formatClock,
+        clampSeconds,
+        totalSeconds,
+        announceCompletion,
+        announceInterval,
+        hush,
+      },
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'advanced-timer: dictionaries')
         const t = ctx.locale.bind(NS)
@@ -1704,20 +2097,20 @@ window.__ModuleLoader__.load({
         })
         engine.setTranslate(t)
         engine.setLocaleGetter(() => ctx.locale.getLocale().active)
-        engine.setSaver(saveSeries)
+        engine.setSaver(saveLibrary)
         engine.restore()
         activeEngine = engine
 
         // The Host's copy is the durable one, but it must not overwrite a run
         // restored from this browser or an edit made while the fetch was in
-        // flight; `pristine` is the series as it stood before either. Comparing
+        // flight; `pristine` is the library as it stood before either. Comparing
         // against it (rather than against "is it non-empty") is what lets a user
-        // who deleted every row keep the deletion instead of having the Host's
-        // copy resurrect it on the next load.
-        const pristine = JSON.stringify(stripStamp(engine.getState().series))
+        // who deleted every configuration keep the deletion instead of having the
+        // Host's copy resurrect it on the next load.
+        const pristine = JSON.stringify(comparableLibrary(engine.getState().library))
         if (typeof fetch === 'function') {
-          void fetchSeries()
-            .then((series) => engine.adoptSeries(series, pristine))
+          void fetchLibrary()
+            .then((library) => engine.adoptLibrary(library, pristine))
             .catch(() => {})
         }
 

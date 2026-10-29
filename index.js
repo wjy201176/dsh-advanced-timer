@@ -2,21 +2,20 @@
  * Advanced Timer — Host half.
  *
  * Owns exactly one thing the page cannot own: the durable copy of the user's
- * interval series. The timer itself runs in the Client, because it is a
- * wall-clock countdown shown in the page and in a floating HUD; a Host-side
- * timer would have to push frames the browser already renders itself.
+ * configurations. Each configuration is a named interval series with its own
+ * audio options, and the Client runs the active one.
  *
  * The state file is written through a temp file and renamed, so a crash
- * mid-write can never leave a truncated series behind. It lives in the
+ * mid-write can never leave a truncated library behind. It lives in the
  * plugin's own directory under `$DSH_HOME`, beside — not inside — the profile,
- * so reinstalling the profile never touches the user's series.
+ * so reinstalling the profile never touches the user's configurations.
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { cleanSeries, SERIES_VERSION } from './lib/series.js'
+import { cleanLibrary, emptyLibrary } from './lib/series.js'
 
 export const name = 'dsh-advanced-timer'
 
@@ -26,10 +25,8 @@ export const inject = ['webServer']
 const ROUTE_PREFIX = '/advanced-timer'
 const API_PREFIX = `${ROUTE_PREFIX}/api`
 
-/** No interval series: the page starts from an empty editor. */
-export function emptySeries() {
-  return cleanSeries({ version: SERIES_VERSION, intervals: [] })
-}
+/** The library a brand-new install starts from. */
+export { emptyLibrary }
 
 /**
  * The state directory for the current process.
@@ -41,39 +38,41 @@ export function dataDir(home = process.env.DSH_HOME ?? join(homedir(), '.dsh')) 
 }
 
 /**
- * The saved series, kept in memory and mirrored to one JSON file.
+ * The saved library, kept in memory and mirrored to one JSON file.
  *
  * Reads are synchronous because they happen once at activation and then once
  * per page open; writes are serialised so two quick saves cannot interleave a
  * rename with a temp-file write.
  */
-export class SeriesStore {
+export class LibraryStore {
   /**
    * @param {string} directory - where the state file lives.
    * @param {{info?: Function, warn?: Function}} [logger] - optional Host logger.
    */
   constructor(directory, logger) {
     this.directory = directory
-    this.file = join(directory, 'series.json')
+    this.file = join(directory, 'library.json')
+    // The single-series file written before configurations existed.
+    this.legacyFile = join(directory, 'series.json')
     this.logger = logger
     this.pending = Promise.resolve()
     this.state = this.#read()
   }
 
-  /** @returns {ReturnType<typeof cleanSeries>} the current series. */
+  /** @returns {ReturnType<typeof cleanLibrary>} the current library. */
   get() {
     return this.state
   }
 
   /**
-   * Replace the saved series.
+   * Replace the saved library.
    * @param {unknown} input - whatever the Client sent.
-   * @returns {Promise<ReturnType<typeof cleanSeries>>} the cleaned, stored series.
+   * @returns {Promise<ReturnType<typeof cleanLibrary>>} the cleaned, stored library.
    */
   update(input) {
     // Stamp the write so a Client can tell whether the Host's copy is newer than
     // what it already holds locally.
-    const next = cleanSeries({ ...(input ?? {}), updatedAt: Date.now() })
+    const next = cleanLibrary({ ...(input ?? {}), updatedAt: Date.now() })
     this.state = next
     const write = this.pending.then(() => this.#write(next))
     // A failed write must not poison the chain for every later save.
@@ -83,12 +82,25 @@ export class SeriesStore {
 
   #read() {
     try {
-      if (!existsSync(this.file)) return emptySeries()
-      const parsed = JSON.parse(readFileSync(this.file, 'utf8'))
-      return cleanSeries(parsed)
+      if (existsSync(this.file)) {
+        return cleanLibrary(JSON.parse(readFileSync(this.file, 'utf8')))
+      }
+      // One-time migration of the version-1 file. The old file is left in place
+      // as a backup; only `library.json` is read from here on.
+      if (existsSync(this.legacyFile)) {
+        const migrated = cleanLibrary(JSON.parse(readFileSync(this.legacyFile, 'utf8')))
+        try {
+          this.#write(migrated)
+          this.logger?.info?.('advanced-timer: migrated the saved series to a library')
+        } catch {
+          /* the read still succeeds; the next save will retry the write */
+        }
+        return migrated
+      }
+      return emptyLibrary()
     } catch (error) {
-      this.logger?.warn?.(`advanced-timer: could not read the saved series (${String(error?.message ?? error)}); starting empty`)
-      return emptySeries()
+      this.logger?.warn?.(`advanced-timer: could not read the saved library (${String(error?.message ?? error)}); starting empty`)
+      return emptyLibrary()
     }
   }
 
@@ -99,7 +111,7 @@ export class SeriesStore {
       writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
       renameSync(temp, this.file)
     } catch (error) {
-      this.logger?.warn?.(`advanced-timer: could not save the series (${String(error?.message ?? error)})`)
+      this.logger?.warn?.(`advanced-timer: could not save the library (${String(error?.message ?? error)})`)
       throw error
     }
   }
@@ -156,7 +168,7 @@ async function readJsonBody(req) {
 
 export function apply(ctx, config) {
   const logger = ctx.logger
-  const store = new SeriesStore(dataDir(), logger)
+  const store = new LibraryStore(dataDir(), logger)
 
   const register = (webServer) => {
     if (webServer === null || typeof webServer !== 'object' || typeof webServer.register !== 'function') {
@@ -189,14 +201,14 @@ export function apply(ctx, config) {
       const path = new URL(req.url ?? '/', 'http://local').pathname.slice(API_PREFIX.length)
       try {
         switch (path) {
-          case '/series': {
+          case '/library': {
             if (methodRefused(req, res, ['GET', 'HEAD', 'POST', 'PUT'])) return
             if (req.method === 'GET' || req.method === 'HEAD') {
               sendJson(res, 200, { ok: true, value: store.get() })
               return
             }
             const body = await readJsonBody(req)
-            const saved = await store.update(body?.series ?? body)
+            const saved = await store.update(body?.library ?? body)
             sendJson(res, 200, { ok: true, value: saved })
             return
           }
