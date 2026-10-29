@@ -1,0 +1,5 @@
+# Advanced Timer bundle: one row that owns the Host state route (the saved
+# interval series) and the Client panel plus its floating HUD.
+- insert:
+    - id: advanced-timer
+      name: dsh-advanced-timer
